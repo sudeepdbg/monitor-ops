@@ -1,1 +1,5 @@
-streamlit>=1.36,<2
+streamlit
+langchain
+langchain-openai
+faiss-cpu
+pandas
