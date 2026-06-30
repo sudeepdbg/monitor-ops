@@ -2,4 +2,3 @@ streamlit>=1.36
 pandas>=2.0
 streamlit-webrtc>=0.47
 av>=12.0
-
