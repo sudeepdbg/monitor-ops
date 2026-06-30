@@ -1,7 +1,5 @@
-streamlit
-langchain
-langchain-openai
-langchain-community
-langchain-text-splitters
-faiss-cpu
-pandas
+streamlit>=1.36
+pandas>=2.0
+streamlit-webrtc>=0.47
+av>=12.0
+
