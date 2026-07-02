@@ -1,7 +1,27 @@
 """
-VideoForge Studio V3.1 (patched)
+VideoForge Studio V4.0 Enterprise
 Professional Video Optimization Platform
 
+⚠️ DEPLOYMENT REMINDER: this app shells out to `ffmpeg` / `ffprobe`.
+   Make sure your repo root has a `packages.txt` containing exactly:
+       ffmpeg
+   (Streamlit Cloud / apt-based hosts only — installs the system binary.)
+
+V4.0 additions over V3.1:
+  - 10-bit encode pipeline for HEVC/AV1 (yuv420p10le)
+  - Ateme-style psycho-visual rate control (aq-mode, psy-rd, extended B-frames/lookahead)
+  - Visionular-style grain management (NLMeans pre-filter / SVT-AV1 native FGS)
+  - Perceptual debanding filter toggle
+  - Strict VBV/HRD "CDN-safe" streaming toggle
+  - Batch encoding tab
+  - Settings export/import (JSON presets)
+  - VMAF "knee" (diminishing-returns) detection in the CRF Sweep tab
+
+Core architecture preserved from V3.1: the VMAF-targeted binary search
+(`find_crf_for_target_vmaf` / `per_title_ladder_measured`) and the two-pass
+guaranteed-target-size encoder (`encode_two_pass` / `bitrate_from_target_size`)
+are untouched in their math — only the encoder flag strings they emit were
+extended with the same enterprise rate-control options used elsewhere.
 """
 
 import os
@@ -18,6 +38,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
@@ -66,7 +87,7 @@ TARGET_PROFILE = "🎯 Target Size (2-pass)"
 # ============================================================
 
 st.set_page_config(
-    page_title="VideoForge Studio",
+    page_title="VideoForge Studio V4.0",
     page_icon="🎬",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -155,6 +176,11 @@ h1, h2, h3, h4 {
     color: #1d4ed8;
     font-weight: 600;
     font-size: .8rem;
+}
+.badge-enterprise {
+    background: #ecfdf5;
+    border-color: #a7f3d0;
+    color: #065f46;
 }
 
 /* ---- section titles ---- */
@@ -301,7 +327,7 @@ h1, h2, h3, h4 {
     font-weight: 700 !important;
 }
 
-/* ---- metrics (Streamlit’s own) ---- */
+/* ---- metrics (Streamlit's own) ---- */
 [data-testid="stMetric"] {
     background: #fff;
     border: 1px solid #e5edf5;
@@ -347,9 +373,9 @@ video {
     border: 1px solid #e5edf5 !important;
     border-radius: 18px !important;
     box-shadow: 0 8px 22px rgba(15,23,42,.04);
-    /* overflow:hidden was clipping select dropdowns / dataframes / wide
-       code blocks rendered inside containers. Corners stay rounded via
-       border-radius; content is no longer cut off. */
+    /* No overflow:hidden here on purpose — it clips select dropdowns,
+       dataframes, and wide code blocks rendered inside containers.
+       Rounded corners come from border-radius alone. */
 }
 
 /* ---- labels ---- */
@@ -393,12 +419,9 @@ li[aria-selected="true"] {
 }
 
 /* ---- EXPANDERS ----
-   NOTE: overflow:hidden on the expander shell used to clip select dropdowns,
-   dataframes, and st.code blocks living inside an expander (anything that
-   needs to render wider/taller than the collapsed shell got cut off — this
-   was the real source of the recurring "DOM overlap" reports). Rounded
-   corners are achieved with border-radius alone; overflow no longer needs
-   to be hidden for that. */
+   Deliberately no overflow:hidden on the expander shell — that used to
+   clip select dropdowns, dataframes, and st.code blocks living inside an
+   expander. Rounded corners are achieved with border-radius alone. */
 [data-testid="stExpander"] {
     background: #ffffff !important;
     border: 1px solid #e5edf5 !important;
@@ -411,7 +434,7 @@ li[aria-selected="true"] {
     border-radius: 16px !important;
 }
 [data-testid="stExpander"] > div:last-child {
-    padding: 0 16px 16px 16px !important;  /* inner padding */
+    padding: 0 16px 16px 16px !important;
 }
 [data-testid="stExpander"] .stMarkdown {
     max-width: 100% !important;
@@ -537,7 +560,7 @@ def save_upload(uploaded, folder: Path) -> Optional[Path]:
         return None
 
     ext = Path(uploaded.name).suffix.lower()
-    p = folder / f"{int(time.time())}_{clean(uploaded.name)}{ext}"
+    p = folder / f"{int(time.time())}_{uuid.uuid4().hex[:6]}_{clean(uploaded.name)}{ext}"
     p.write_bytes(uploaded.getbuffer())
     return p
 
@@ -759,10 +782,38 @@ def map_slider_to_profile(goal: int) -> str:
 # ============================================================
 
 def build_filter_chain(opts: Dict[str, Any], src_meta: Dict[str, Any]) -> str:
+    """
+    Enterprise note on ordering: grain removal / denoise run first (clean the
+    signal before anything else touches it), then debanding (needs a clean,
+    not-yet-recompressed image to find gradients), then deblock/HDR-SDR/color,
+    then geometry (scale), then sharpen (should be the last thing before
+    encode so it isn't softened by a later resize), then interpolation last.
+    """
     f: List[str] = []
+
+    grain_removal = opts.get("grain_removal")
+    codec = opts.get("codec", "")
+
+    if grain_removal:
+        # SVT-AV1 has native film-grain synthesis (encode clean, re-synthesize
+        # grain on playback via AV1 film-grain metadata) — handled entirely in
+        # codec_args via -svtav1-params film-grain=..., so skip the pre-filter
+        # here to avoid denoising twice.
+        uses_svt_fgs = (codec == "AV1" and has_encoder("libsvtav1"))
+        if not uses_svt_fgs:
+            if has_filter("nlmeans"):
+                f.append("nlmeans=s=3:p=7:r=5")
+            else:
+                f.append("hqdn3d=4:3:5:4")
 
     if opts.get("denoise"):
         f.append("hqdn3d=2:2:4:4")
+
+    if opts.get("deband"):
+        if has_filter("deband"):
+            f.append("deband=range=16:1thr=0.02:2thr=0.02:3thr=0.02:4thr=0.02:blur=1")
+        elif has_filter("f3kdb"):
+            f.append("f3kdb=range=15")
 
     if opts.get("deblock") and has_filter("deblock"):
         f.append("deblock")
@@ -820,6 +871,8 @@ def codec_args(
     src_meta: Dict[str, Any],
     content_tune: str = "Auto",
     maxrate_kbps: Optional[int] = None,
+    grain_removal: bool = False,
+    strict_vbv: bool = False,
 ) -> Tuple[List[str], str, str, str, str]:
     """
     content_tune: "Auto" (default psy/AQ tuning), "Film / live-action",
@@ -828,6 +881,19 @@ def codec_args(
     expose, approximated here with the equivalent open x264/x265/SVT-AV1
     flags — psy-rd and AQ mode change how bits get allocated within a
     frame, not just how many bits are used.
+
+    Enterprise rate-control ("secret sauce") applied unconditionally for
+    x264/x265/SVT-AV1 below: aq-mode=3 (variance-based adaptive
+    quantization), higher psy-rd (protects perceptual detail against
+    RDO's tendency to blur it away), a deeper B-frame/lookahead window
+    (ref=6, bframes=8, b-adapt=2 / b-pyramid=1, rc-lookahead=40,
+    scenecut=40) so the encoder can plan bit allocation over a longer
+    horizon — the same class of technique Ateme/Beamr/Visionular
+    "content-adaptive" modes use, expressed here in stock libx264/
+    libx265/SVT-AV1 flags rather than a proprietary model.
+
+    grain_removal / strict_vbv are optional per-encode toggles wired
+    through from the "Advanced Engine Tuning" UI section.
     """
     width = src_meta.get("width", 1280)
     mbr_key = "mbr_1080p" if width >= 1500 else "mbr_720p"
@@ -839,7 +905,7 @@ def codec_args(
             "-c:v", enc,
             "-preset", preset,
             "-crf", str(crf),
-            "-pix_fmt", "yuv420p",
+            "-pix_fmt", "yuv420p",   # H.264 stays 8-bit for maximum device compatibility
             "-c:a", "aac",
             "-b:a", profile["audio_aac"],
             "-movflags", "+faststart",
@@ -848,33 +914,51 @@ def codec_args(
         if enc == "libx264":
             args += ["-g", str(gop), "-keyint_min", str(gop), "-sc_threshold", "40"]
 
-            x264_params = ["aq-mode=3", "aq-strength=0.9"]
+            x264_params = [
+                "aq-mode=3", "aq-strength=1.1",
+                "ref=6", "bframes=8", "b-adapt=2",
+                "rc-lookahead=40", "scenecut=40",
+            ]
+
             if content_tune == "Animation":
                 args += ["-tune", "animation"]
             elif content_tune == "Screen / UGC-graphics":
                 x264_params += ["psy-rd=0.4,0.0"]
             elif content_tune == "Grain-heavy":
                 args += ["-tune", "grain"]
+                x264_params += ["psy-rd=1.0,0.2"]
             else:
-                x264_params += ["psy-rd=1.0,0.15"]
-            args += ["-x264-params", ":".join(x264_params)]
+                x264_params += ["psy-rd=1.0,0.2"]
 
-            if maxrate_kbps:
+            if strict_vbv and maxrate_kbps:
+                minrate = max(100, int(maxrate_kbps * 0.5))
+                x264_params += ["nal-hrd=cbr"]
+                args += [
+                    "-maxrate", f"{maxrate_kbps}k",
+                    "-minrate", f"{minrate}k",
+                    "-bufsize", f"{maxrate_kbps}k",
+                ]
+            elif maxrate_kbps:
                 args += ["-maxrate", f"{maxrate_kbps}k", "-bufsize", f"{maxrate_kbps * 2}k"]
+
+            args += ["-x264-params", ":".join(x264_params)]
 
         return args, ".mp4", "video/mp4", enc, ""
 
     if codec == "HEVC (H.265)":
         enc = "libx265" if has_encoder("libx265") else "hevc"
+        pix_fmt = "yuv420p10le" if enc == "libx265" else "yuv420p"
+
         args = [
             "-c:v", enc,
             "-preset", preset,
             "-crf", str(crf),
-            "-pix_fmt", "yuv420p",
+            "-pix_fmt", pix_fmt,   # 10-bit pipeline: eliminates banding, ~15% efficiency gain
             "-c:a", "aac",
             "-b:a", profile["audio_aac"],
             "-movflags", "+faststart",
         ]
+
         if enc == "libx265":
             x265_params = [
                 "log-level=error",
@@ -882,13 +966,31 @@ def codec_args(
                 f"keyint={gop}",
                 f"min-keyint={gop}",
                 "aq-mode=3",
-                "aq-strength=0.9",
+                "aq-strength=1.1",
+                "psy-rd=1.0",
+                "psy-rdoq=1.0",
+                "ref=6",
+                "bframes=8",
+                "b-adapt=2",
+                "b-pyramid=1",
+                "rc-lookahead=40",
+                "scenecut=40",
             ]
+
             if content_tune == "Grain-heavy":
                 x265_params.append("rd=4")
-            if maxrate_kbps:
+
+            if strict_vbv and maxrate_kbps:
+                x265_params += [
+                    "hrd=1",
+                    f"vbv-maxrate={maxrate_kbps}",
+                    f"vbv-bufsize={maxrate_kbps}",
+                ]
+            elif maxrate_kbps:
                 x265_params += [f"vbv-maxrate={maxrate_kbps}", f"vbv-bufsize={maxrate_kbps * 2}"]
+
             args += ["-tag:v", "hvc1", "-x265-params", ":".join(x265_params)]
+
         return args, ".mp4", "video/mp4", enc, ""
 
     av1_cfg = profile["av1"]
@@ -896,7 +998,14 @@ def codec_args(
 
     if has_encoder("libsvtav1"):
         svt_params = [f"tune={0 if content_tune == 'Grain-heavy' else 1}"]
-        if content_tune == "Grain-heavy":
+
+        if grain_removal:
+            # Native film-grain synthesis: encode a denoised frame, then have
+            # the decoder re-synthesize matching grain from AV1 film-grain
+            # metadata — visually preserves grain "look" at a fraction of the
+            # bitrate cost of actually compressing real noise.
+            svt_params += ["film-grain=8", "film-grain-denoise=1"]
+        elif content_tune == "Grain-heavy":
             svt_params.append("film-grain=8")
 
         args = [
@@ -904,13 +1013,16 @@ def codec_args(
             "-crf", str(crf),
             "-preset", str(av1_cfg["preset"]),
             "-g", str(gop),
-            "-pix_fmt", "yuv420p",
+            "-pix_fmt", "yuv420p10le",   # 10-bit pipeline for AV1
             "-svtav1-params", ":".join(svt_params),
             "-c:a", "libopus",
             "-b:a", profile["audio_opus"],
         ]
 
-        if mbr and mbr > 0:
+        if strict_vbv and mbr and mbr > 0:
+            minrate = max(100, int(mbr * 0.5))
+            args += ["-maxrate", f"{mbr}k", "-minrate", f"{minrate}k", "-bufsize", f"{mbr}k"]
+        elif mbr and mbr > 0:
             args += ["-maxrate", f"{mbr}k", "-bufsize", f"{mbr * 2}k"]
 
         return args, ".webm", "video/webm", "libsvtav1", ""
@@ -923,10 +1035,17 @@ def codec_args(
             "-cpu-used", "6",
             "-row-mt", "1",
             "-g", str(gop),
-            "-pix_fmt", "yuv420p",
+            "-pix_fmt", "yuv420p10le",
             "-c:a", "libopus",
             "-b:a", profile["audio_opus"],
         ]
+
+        if strict_vbv and mbr and mbr > 0:
+            minrate = max(100, int(mbr * 0.5))
+            args += ["-maxrate", f"{mbr}k", "-minrate", f"{minrate}k", "-bufsize", f"{mbr}k"]
+        elif mbr and mbr > 0:
+            args += ["-maxrate", f"{mbr}k", "-bufsize", f"{mbr * 2}k"]
+
         return args, ".webm", "video/webm", "libaom-av1", ""
 
     fallback_profile = profile
@@ -937,6 +1056,9 @@ def codec_args(
         fallback_profile,
         src_meta,
         content_tune,
+        maxrate_kbps,
+        grain_removal=grain_removal,
+        strict_vbv=strict_vbv,
     )
     return args, ext, mime, actual, "AV1 encoder unavailable. Fell back to H.264."
 
@@ -963,6 +1085,10 @@ def estimate_output(src_meta: Dict[str, Any], codec: str, crf: int, enhancements
         enh_factor *= 1.10
     if enhancements.get("color"):
         enh_factor *= 1.05
+    if enhancements.get("grain_removal"):
+        enh_factor *= 0.92   # stripped noise needs fewer bits to represent
+    if enhancements.get("deband"):
+        enh_factor *= 1.02   # smoothed gradients cost a small amount extra
     if enhancements.get("interp") and src_meta.get("fps", 0) < 50:
         enh_factor *= 1.7
     if enhancements.get("scale_to", "Source") != "Source":
@@ -983,6 +1109,9 @@ def estimate_output(src_meta: Dict[str, Any], codec: str, crf: int, enhancements
 
     if enhancements.get("scale_to", "Source") in ["1080p", "2160p"]:
         speed_mult *= 1.6
+
+    if enhancements.get("grain_removal"):
+        speed_mult *= 1.3   # NLMeans pre-filter is not free
 
     est_time_sec = duration * speed_mult * 0.5
 
@@ -1041,6 +1170,7 @@ def _run_encode_pass(
     cb=None,
     phase: Tuple[float, float] = (0.0, 1.0),
     label: str = "Encoding",
+    timeout: int = 3600,
 ) -> Tuple[int, List[str]]:
     lines: List[str] = []
     lo, hi = phase
@@ -1049,34 +1179,50 @@ def _run_encode_pass(
     with log.open("a", encoding="utf-8") as f:
         f.write("\n\n$ " + " ".join(map(str, cmd)) + "\n")
 
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1,
-    )
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+    except Exception as e:
+        with log.open("a", encoding="utf-8") as f:
+            f.write(f"\n[launch error] {e}\n")
+        return -1, [f"Failed to launch ffmpeg: {e}"]
 
     last = lo
+    start_t = time.time()
 
     assert proc.stderr is not None
 
-    for line in proc.stderr:
-        lines.append(line.rstrip())
+    try:
+        for line in proc.stderr:
+            lines.append(line.rstrip())
+            with log.open("a", encoding="utf-8") as f:
+                f.write(line)
+
+            m = re.search(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)", line)
+            if m and cb and duration > 0:
+                sec = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+                pct = lo + (hi - lo) * min(max(sec / duration, 0.0), 1.0)
+                pct = max(pct, last)
+                last = pct
+
+                try:
+                    cb(pct, f"{label}… {pct * 100:.0f}%")
+                except Exception:
+                    pass
+
+            if time.time() - start_t > timeout:
+                proc.kill()
+                with log.open("a", encoding="utf-8") as f:
+                    f.write(f"\n[timeout after {timeout}s] killed\n")
+                return -9, lines
+    except Exception as e:
         with log.open("a", encoding="utf-8") as f:
-            f.write(line)
-
-        m = re.search(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)", line)
-        if m and cb and duration > 0:
-            sec = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
-            pct = lo + (hi - lo) * min(max(sec / duration, 0.0), 1.0)
-            pct = max(pct, last)
-            last = pct
-
-            try:
-                cb(pct, f"{label}… {pct * 100:.0f}%")
-            except Exception:
-                pass
+            f.write(f"\n[stream read error] {e}\n")
 
     rc = proc.wait()
 
@@ -1101,7 +1247,13 @@ def run_ffmpeg(cmd: List[str], log: Path, timeout: int = 900) -> str:
 
         return p.stdout or ""
 
+    except subprocess.TimeoutExpired:
+        with log.open("a", encoding="utf-8") as f:
+            f.write(f"\n[timeout after {timeout}s]\n")
+        return "[timeout]"
     except Exception as e:
+        with log.open("a", encoding="utf-8") as f:
+            f.write(f"\n[error] {e}\n")
         return str(e)
 
 
@@ -1138,12 +1290,19 @@ def encode_video(
     preset = str(opts["preset"])
 
     maxrate_kbps = None
-    if opts.get("cap_peak_bitrate"):
+    if opts.get("cap_peak_bitrate") or opts.get("strict_vbv"):
         est = estimate_output(src_meta, codec, crf, opts)
-        maxrate_kbps = max(300, int(est["est_bitrate_kbps"] * 2.2))
+        # Strict streaming wants a tight peak/average ratio (CDN/HLS-safe,
+        # ~1.5x is the common Apple HLS recommendation); the looser "cap
+        # peak bitrate" checkbox just wants to stop runaway spikes.
+        mult = 1.5 if opts.get("strict_vbv") else 2.2
+        maxrate_kbps = max(300, int(est["est_bitrate_kbps"] * mult))
 
     args, ext, mime, actual_encoder, warning = codec_args(
-        codec, crf, preset, profile, src_meta, opts.get("content_tune", "Auto"), maxrate_kbps
+        codec, crf, preset, profile, src_meta,
+        opts.get("content_tune", "Auto"), maxrate_kbps,
+        grain_removal=opts.get("grain_removal", False),
+        strict_vbv=opts.get("strict_vbv", False),
     )
 
     codec_label = actual_encoder.replace("lib", "").replace("-", "")
@@ -1207,6 +1366,13 @@ def encode_two_pass(
     sid: str,
     cb=None,
 ) -> Tuple[Optional[Path], Path, Dict[str, Any]]:
+    """
+    Guaranteed-target-size two-pass encoder. Core bitrate math
+    (`bitrate_from_target_size`) is unchanged from V3.1 — only the encoder
+    flag strings passed to ffmpeg were extended with the same 10-bit /
+    psycho-visual / strict-VBV options used in `codec_args`, kept consistent
+    with the CRF-mode encoder path.
+    """
     log = LOG_DIR / f"{sid}.log"
     info = ffinfo()
 
@@ -1222,6 +1388,8 @@ def encode_two_pass(
     preset = opts.get("preset", "medium")
     target_mb = float(opts.get("target_mb", 25))
     audio_kbps = int(opts.get("audio_kbps", 128))
+    grain_removal = bool(opts.get("grain_removal", False))
+    strict_vbv = bool(opts.get("strict_vbv", False))
 
     safety_margin_pct = float(opts.get("safety_margin_pct", 6.0))
     v_kbps = bitrate_from_target_size(duration, target_mb, audio_kbps, safety_margin_pct)
@@ -1254,11 +1422,43 @@ def encode_two_pass(
         base += ["-vf", vf]
 
     v_args = ["-c:v", venc, "-b:v", f"{v_kbps}k", "-passlogfile", passlog]
+    minrate_kbps = max(100, int(v_kbps * 0.5))
 
     if venc in ("libx264", "libx265"):
         v_args += ["-preset", preset]
+
+        if venc == "libx265":
+            v_args += ["-pix_fmt", "yuv420p10le"]
+            x265_params = [
+                "aq-mode=3", "aq-strength=1.1", "psy-rd=1.0", "psy-rdoq=1.0",
+                "ref=6", "bframes=8", "b-adapt=2", "b-pyramid=1",
+                "rc-lookahead=40", "scenecut=40",
+            ]
+            if strict_vbv:
+                x265_params += ["hrd=1", f"vbv-maxrate={v_kbps}", f"vbv-bufsize={v_kbps}"]
+            else:
+                x265_params += [f"vbv-maxrate={int(v_kbps * 1.3)}", f"vbv-bufsize={v_kbps * 2}"]
+            v_args += ["-x265-params", ":".join(x265_params)]
+        else:
+            v_args += ["-pix_fmt", "yuv420p"]
+            x264_params = [
+                "aq-mode=3", "aq-strength=1.1", "psy-rd=1.0,0.2",
+                "ref=6", "bframes=8", "b-adapt=2",
+                "rc-lookahead=40", "scenecut=40",
+            ]
+            if strict_vbv:
+                x264_params.append("nal-hrd=cbr")
+                v_args += ["-maxrate", f"{v_kbps}k", "-minrate", f"{minrate_kbps}k", "-bufsize", f"{v_kbps}k"]
+            else:
+                v_args += ["-maxrate", f"{int(v_kbps * 1.3)}k", "-bufsize", f"{v_kbps * 2}k"]
+            v_args += ["-x264-params", ":".join(x264_params)]
+
     elif venc == "libaom-av1":
-        v_args += ["-cpu-used", "6", "-row-mt", "1"]
+        v_args += ["-cpu-used", "6", "-row-mt", "1", "-pix_fmt", "yuv420p10le"]
+        if strict_vbv:
+            v_args += ["-maxrate", f"{v_kbps}k", "-minrate", f"{minrate_kbps}k", "-bufsize", f"{v_kbps}k"]
+        else:
+            v_args += ["-maxrate", f"{int(v_kbps * 1.3)}k", "-bufsize", f"{v_kbps * 2}k"]
 
     cmd1 = base + v_args + ["-an", "-pass", "1", "-f", "null", os.devnull]
     rc1, lines1 = _run_encode_pass(
@@ -1278,7 +1478,6 @@ def encode_two_pass(
 
     cmd2 = base + v_args + [
         "-pass", "2",
-        "-pix_fmt", "yuv420p",
         "-c:a", acodec,
         "-b:a", f"{audio_kbps}k",
     ]
@@ -1474,6 +1673,9 @@ def find_crf_for_target_vmaf(
     fixed CRF/bitrate works equally well for every title. Only a short
     sample window is encoded per probe to keep this fast enough to run
     inline in a Streamlit session.
+
+    UNCHANGED from V3.1 — this is the core "secret sauce" algorithm and its
+    math is preserved exactly.
     """
     info = ffinfo()
     lo, hi = crf_lo, crf_hi
@@ -1545,6 +1747,8 @@ def per_title_ladder_measured(
     actual rate-distortion measurement per rung, per title — the core idea
     behind Netflix's per-title encoding and Visionular Aurora's CAE, without
     requiring their proprietary encoder.
+
+    UNCHANGED from V3.1 — core "secret sauce" logic preserved exactly.
     """
     duration = src_meta.get("duration", 0) or 0
     start = max(0.0, duration / 2 - sample_sec / 2) if duration else 0.0
@@ -1690,6 +1894,8 @@ def make_hls(src: Path, sid: str, ladder: Optional[List[Dict[str, Any]]] = None)
             else:
                 errors.append(f"{h}p failed")
 
+        except subprocess.TimeoutExpired:
+            errors.append(f"{h}p failed: timeout")
         except Exception as e:
             errors.append(f"{h}p failed: {e}")
 
@@ -1717,6 +1923,9 @@ CSV_FIELDS = [
     "source_mb",
     "output_mb",
     "saved_pct",
+    "grain_removal",
+    "deband",
+    "strict_vbv",
     "PSNR",
     "SSIM",
     "VMAF",
@@ -1765,8 +1974,7 @@ def player(path: Path, poster: Optional[Path], mime: str):
     Universal inline player. IMPORTANT: the <video> element must contain a
     proper <source> tag — if it doesn't, browsers fall back to rendering the
     element's raw text content, which here would be a multi-megabyte base64
-    string dumped visibly into the page (this was the cause of the reported
-    "overlap"/broken layout — not a CSS issue).
+    string dumped visibly into the page.
     """
     if not path or not path.exists():
         return
@@ -1793,7 +2001,7 @@ def player(path: Path, poster: Optional[Path], mime: str):
             </video>
         </div>
         """,
-        height=None,   # let the browser size it automatically
+        height=None,
     )
 
 
@@ -1811,6 +2019,7 @@ for k in [
     "last_log",
     "upload_src_id",
     "upload_img_id",
+    "_last_preset_import",
 ]:
     if k not in st.session_state:
         st.session_state[k] = None
@@ -1826,8 +2035,8 @@ av1_ready = has_encoder("libsvtav1") or has_encoder("libaom-av1")
 st.markdown(
     f"""
 <div class='hero'>
-  <h1>🎬 VideoForge Studio</h1>
-  <p>Professional video optimization platform — intent-based encoding, target-size control, smart enhancement, side-by-side analysis, CRF sweep, and ABR packaging.</p>
+  <h1>🎬 VideoForge Studio <span style='font-size:1.1rem;font-weight:700;color:#059669'>V4.0 Enterprise</span></h1>
+  <p>Professional video optimization platform — intent-based encoding, target-size control, smart enhancement, side-by-side analysis, CRF sweep with VMAF knee detection, ABR packaging, and batch processing.</p>
   <div style='margin-top:12px'>
     <span class='badge'>{'✅' if info['ffmpeg'] else '❌'} FFmpeg</span>
     <span class='badge'>{'✅' if has_encoder('libx264') else '⚠️'} H.264</span>
@@ -1835,6 +2044,7 @@ st.markdown(
     <span class='badge'>{'✅' if av1_ready else '⚠️'} AV1</span>
     <span class='badge'>{'✅' if has_filter('libvmaf') else '⚠️'} VMAF</span>
     <span class='badge'>{'✅' if has_filter('signalstats') else '⚠️'} Per-title analysis</span>
+    <span class='badge badge-enterprise'>🧠 10-bit + psycho-visual RC</span>
   </div>
 </div>
 """,
@@ -1850,8 +2060,8 @@ if not info["ffmpeg"]:
 # Tabs
 # ============================================================
 
-tab_work, tab_compare, tab_player, tab_quality, tab_sweep, tab_abr, tab_logs = st.tabs(
-    ["🛠️ Workflow", "🆚 Compare", "▶️ Player", "📊 Quality", "📈 CRF Sweep", "📡 ABR", "🪵 Logs"]
+tab_work, tab_batch, tab_compare, tab_player, tab_quality, tab_sweep, tab_abr, tab_logs = st.tabs(
+    ["🛠️ Workflow", "📦 Batch", "🆚 Compare", "▶️ Player", "📊 Quality", "📈 CRF Sweep", "📡 ABR", "🪵 Logs"]
 )
 
 
@@ -1860,6 +2070,43 @@ tab_work, tab_compare, tab_player, tab_quality, tab_sweep, tab_abr, tab_logs = s
 # ============================================================
 
 with tab_work:
+
+    # -------- Presets (export / import) --------
+    with st.expander("💾 Presets", expanded=False):
+        st.caption("Save your current encoder settings to a JSON file, or load a previously saved preset.")
+        pcol1, pcol2 = st.columns(2)
+
+        with pcol1:
+            preset_file = st.file_uploader("Import settings JSON", type=["json"], key="preset_import")
+            if preset_file and st.session_state.get("_last_preset_import") != preset_file.name:
+                try:
+                    loaded = json.loads(preset_file.read().decode("utf-8"))
+                    for k, v in loaded.items():
+                        st.session_state[k] = v
+                    st.session_state["_last_preset_import"] = preset_file.name
+                    st.success("Preset loaded — settings applied.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Could not read preset file: {e}")
+
+        with pcol2:
+            _preset_keys = [
+                "wf_mode", "wf_goal", "wf_profile_override", "wf_codec_target", "wf_codec_crf",
+                "wf_crf", "wf_preset_crf", "wf_preset_target", "wf_target_mb", "wf_target_audio_kbps",
+                "wf_safety_margin", "wf_denoise", "wf_deblock", "wf_sharpen", "wf_color", "wf_hdr_sdr",
+                "wf_interp", "wf_scale_to", "wf_content_tune", "wf_cap_peak", "wf_grain", "wf_deband",
+                "wf_strict_vbv", "wf_image_mode", "wf_logo_pos", "wf_logo_scale",
+            ]
+            export_dict = {k: st.session_state[k] for k in _preset_keys if k in st.session_state}
+            st.download_button(
+                "⬇ Export current settings",
+                json.dumps(export_dict, indent=2).encode(),
+                "videoforge_preset.json",
+                "application/json",
+                disabled=not export_dict,
+                help="Encode at least once (or touch the settings below) so there's something to export." if not export_dict else None,
+            )
+
     st.markdown("<div class='section-title'>Step 1 · Upload</div>", unsafe_allow_html=True)
 
     with st.container(border=True):
@@ -1928,7 +2175,7 @@ with tab_work:
                 unsafe_allow_html=True,
             )
 
-    st.markdown("<br>", unsafe_allow_html=True)   # vertical spacing
+    st.markdown("<br>", unsafe_allow_html=True)
 
     st.markdown("<div class='section-title'>Step 2 · Optimization Goal</div>", unsafe_allow_html=True)
 
@@ -1937,6 +2184,7 @@ with tab_work:
             "Output control",
             ["Best quality at CRF", "Guaranteed target size"],
             horizontal=True,
+            key="wf_mode",
             help="CRF optimizes quality/compression but does not guarantee smaller output. Target size uses two-pass bitrate encoding.",
         )
 
@@ -1951,6 +2199,7 @@ with tab_work:
                 0,
                 100,
                 55,
+                key="wf_goal",
                 help="0 = max quality, 100 = smallest file",
             )
             profile_name = map_slider_to_profile(goal)
@@ -1959,6 +2208,7 @@ with tab_work:
                 "Profile override",
                 crf_profiles,
                 index=crf_profiles.index(profile_name),
+                key="wf_profile_override",
             )
             profile = PROFILES[profile_name]
 
@@ -1972,7 +2222,7 @@ with tab_work:
                     "Codec",
                     ["AVC (H.264)", "HEVC (H.265)", "AV1"],
                     index=0,
-                    key="target_codec",
+                    key="wf_codec_target",
                     help="AV1 target-size requires libaom-av1. If unavailable, the app falls back to H.264 and shows a warning.",
                 )
 
@@ -1983,17 +2233,19 @@ with tab_work:
                     max_value=20000.0,
                     value=25.0,
                     step=1.0,
+                    key="wf_target_mb",
                 )
 
             with tc3:
-                target_audio_kbps = st.selectbox("Audio bitrate", [64, 96, 128, 160, 192], index=2)
+                target_audio_kbps = st.selectbox("Audio bitrate", [64, 96, 128, 160, 192], index=2, key="wf_target_audio_kbps")
 
             with tc4:
-                preset = st.selectbox("Preset", ["veryfast", "fast", "medium", "slow"], index=2)
+                preset = st.selectbox("Preset", ["veryfast", "fast", "medium", "slow"], index=2, key="wf_preset_target")
 
             safety_margin_pct = st.slider(
                 "Safety margin",
                 2, 15, 6,
+                key="wf_safety_margin",
                 help="Encoder rate-control accuracy plus container overhead means an encode aimed exactly "
                      "at the cap can occasionally land a little over it. This margin is subtracted before "
                      "computing the target bitrate — raise it if you're hitting a hard limit (e.g. an "
@@ -2014,13 +2266,14 @@ with tab_work:
                     "Codec",
                     ["AVC (H.264)", "HEVC (H.265)", "AV1"],
                     index=["AVC (H.264)", "HEVC (H.265)", "AV1"].index(profile["default_codec"]),
+                    key="wf_codec_crf",
                 )
 
             if codec == "AV1":
                 default_crf = profile["av1"]["crf"]
                 default_preset = profile["av1"]["preset"]
                 preset_opts = ["4", "5", "6", "7", "8"]
-                st.info("AV1 output uses WebM. Some environments may not preview AV1 WebM reliably.")
+                st.info("AV1 output uses WebM (10-bit pipeline). Some environments may not preview AV1 WebM reliably.")
             elif codec == "HEVC (H.265)":
                 default_crf = profile["hevc"]["crf"]
                 default_preset = profile["hevc"]["preset"]
@@ -2036,6 +2289,7 @@ with tab_work:
                     14,
                     45,
                     int(default_crf),
+                    key="wf_crf",
                     help="Lower = higher quality + larger file. Higher = smaller file + lower quality.",
                 )
 
@@ -2045,7 +2299,7 @@ with tab_work:
                 except ValueError:
                     preset_idx = 0
 
-                preset = st.selectbox("Preset override", preset_opts, index=preset_idx)
+                preset = st.selectbox("Preset override", preset_opts, index=preset_idx, key="wf_preset_crf")
 
             tc_col1, tc_col2 = st.columns(2)
             with tc_col1:
@@ -2053,6 +2307,7 @@ with tab_work:
                     "Content tuning",
                     ["Auto", "Film / live-action", "Animation", "Screen / UGC-graphics", "Grain-heavy"],
                     index=0,
+                    key="wf_content_tune",
                     help="Adjusts psy-RD / adaptive-quantization behavior per content type — the same "
                          "idea behind Aurora/CAE 'scene-based optimization' presets, approximated with "
                          "open x264/x265/SVT-AV1 tuning flags rather than a proprietary model.",
@@ -2061,9 +2316,11 @@ with tab_work:
                 cap_peak_bitrate = st.checkbox(
                     "Cap peak bitrate (streaming-safe)",
                     value=False,
+                    key="wf_cap_peak",
                     help="Adds -maxrate/-bufsize around the CRF estimate so a single complex scene can't "
                          "spike the bitrate far past the average — recommended for anything going through "
-                         "a CDN/ABR pipeline with fixed peak-bandwidth budgets.",
+                         "a CDN/ABR pipeline with fixed peak-bandwidth budgets. For a stricter guarantee, "
+                         "see 'Strict Streaming' in Advanced Engine Tuning below.",
                 )
 
             target_mb, target_audio_kbps = None, None
@@ -2075,18 +2332,51 @@ with tab_work:
     with st.container(border=True):
         with st.expander("🛡️ Quality enhancement", expanded=True):
             e1, e2, e3 = st.columns(3)
-            denoise = e1.checkbox("Denoise", value=False)
-            deblock = e2.checkbox("Deblock", value=False)
-            sharpen = e3.checkbox("Sharpen", value=False)
+            denoise = e1.checkbox("Denoise", value=False, key="wf_denoise")
+            deblock = e2.checkbox("Deblock", value=False, key="wf_deblock")
+            sharpen = e3.checkbox("Sharpen", value=False, key="wf_sharpen")
+
+        with st.expander("🧠 Advanced Engine Tuning", expanded=False):
+            st.caption(
+                "Enterprise-grade psycho-visual and rate-control techniques inspired by Ateme/Visionular-class "
+                "encoders, layered on top of the codec's baked-in 10-bit + AQ/psy-RD tuning applied above."
+            )
+            at1, at2, at3 = st.columns(3)
+
+            grain_removal = at1.checkbox(
+                "🎞️ Grain management",
+                value=False,
+                key="wf_grain",
+                help="x264/x265: strips grain with NLMeans (or hqdn3d fallback) before encoding, so bits "
+                     "aren't wasted compressing noise. SVT-AV1: skips the pre-filter and instead uses the "
+                     "encoder's native film-grain synthesis — encode clean, re-synthesize matching grain "
+                     "on playback via AV1 film-grain metadata.",
+            )
+            deband = at2.checkbox(
+                "🌈 Perceptual debanding",
+                value=False,
+                key="wf_deband",
+                help="Applies the `deband` filter pre-encode to remove gradient banding in dark scenes and "
+                     "skies — often a free VMAF win on 8-bit sources with smooth gradients.",
+            )
+            strict_vbv = at3.checkbox(
+                "📡 Strict Streaming (CDN-safe VBV)",
+                value=False,
+                key="wf_strict_vbv",
+                help="Enforces hard VBV/HRD bounds (nal-hrd=cbr on x264, hrd=1 on x265) with tight "
+                     "maxrate/bufsize so bitrate spikes can't blow through a fixed CDN/ABR peak-bandwidth "
+                     "budget. Recommended for anything served over HLS/DASH.",
+            )
 
         with st.expander("🎨 Color processing", expanded=False):
             c1, c2 = st.columns(2)
-            color = c1.checkbox("Color boost", value=False)
+            color = c1.checkbox("Color boost", value=False, key="wf_color")
             is_hdr_src = detect_hdr(src_meta) if src_meta else False
             hdr_sdr = c2.checkbox(
                 "HDR → SDR",
                 value=is_hdr_src,
                 disabled=not is_hdr_src,
+                key="wf_hdr_sdr",
                 help="Enabled only when HDR metadata is detected.",
             )
 
@@ -2096,6 +2386,7 @@ with tab_work:
                 "Frame interpolation → 60fps",
                 value=False,
                 disabled=not interp_recommended,
+                key="wf_interp",
                 help="Disabled when source is already ≥ 50 fps.",
             )
 
@@ -2104,6 +2395,7 @@ with tab_work:
                 "Target resolution",
                 ["Source", "480p", "720p", "1080p", "2160p"],
                 index=0,
+                key="wf_scale_to",
             )
 
         with st.expander("🖼️ Image / logo overlay", expanded=False):
@@ -2116,11 +2408,12 @@ with tab_work:
                     "Attached image behavior",
                     ["Ignore image", "Watermark / logo overlay", "Poster only in player"],
                     index=1 if st.session_state.img else 0,
+                    key="wf_image_mode",
                 )
 
                 lc1, lc2 = st.columns(2)
-                logo_pos = lc1.selectbox("Logo position", ["Top right", "Top left", "Bottom right", "Bottom left"])
-                logo_scale = lc2.slider("Logo scale %", 5, 35, 14)
+                logo_pos = lc1.selectbox("Logo position", ["Top right", "Top left", "Bottom right", "Bottom left"], key="wf_logo_pos")
+                logo_scale = lc2.slider("Logo scale %", 5, 35, 14, key="wf_logo_scale")
 
     enhancements = dict(
         denoise=denoise,
@@ -2130,6 +2423,8 @@ with tab_work:
         hdr_sdr=hdr_sdr,
         interp=interp,
         scale_to=scale_to,
+        grain_removal=grain_removal,
+        deband=deband,
     )
 
     if src_meta and not is_target_mode:
@@ -2223,6 +2518,9 @@ with tab_work:
                         hdr_sdr=hdr_sdr,
                         interp=interp,
                         scale_to=scale_to,
+                        grain_removal=grain_removal,
+                        deband=deband,
+                        strict_vbv=strict_vbv,
                     )
 
                     out_path, log, md = encode_two_pass(
@@ -2251,6 +2549,9 @@ with tab_work:
                         logo_scale=logo_scale,
                         content_tune=content_tune,
                         cap_peak_bitrate=cap_peak_bitrate,
+                        grain_removal=grain_removal,
+                        deband=deband,
+                        strict_vbv=strict_vbv,
                     )
 
                     out_path, log, md = encode_video(
@@ -2306,6 +2607,9 @@ with tab_work:
                         "source_mb": round(sm["size_mb"], 3),
                         "output_mb": round(dm["size_mb"], 3),
                         "saved_pct": round(saved, 2),
+                        "grain_removal": grain_removal,
+                        "deband": deband,
+                        "strict_vbv": strict_vbv,
                         "PSNR": q.get("PSNR"),
                         "SSIM": q.get("SSIM"),
                         "VMAF": q.get("VMAF"),
@@ -2327,8 +2631,143 @@ with tab_work:
                         md.get("mime", "application/octet-stream"),
                     )
 
-    # final spacing after encode button
     st.markdown("<br>", unsafe_allow_html=True)
+
+
+# ============================================================
+# Batch tab
+# ============================================================
+
+with tab_batch:
+    st.markdown("<div class='section-title'>Batch Encoding</div>", unsafe_allow_html=True)
+    st.caption("Upload multiple files, pick a shared profile/codec, and process them sequentially with a master progress bar.")
+
+    with st.container(border=True):
+        batch_files = st.file_uploader(
+            "Upload multiple source videos",
+            type=["mp4", "mov", "mkv", "webm", "avi", "m4v", "ts"],
+            accept_multiple_files=True,
+            key="batch_upload",
+        )
+
+        bc1, bc2, bc3 = st.columns(3)
+
+        batch_profile = bc1.selectbox(
+            "Profile",
+            [k for k in PROFILES if k != TARGET_PROFILE],
+            index=1,
+            key="batch_profile",
+        )
+        batch_codec = bc2.selectbox("Codec", ["AVC (H.264)", "HEVC (H.265)", "AV1"], key="batch_codec")
+        batch_preset = bc3.selectbox("Preset", ["veryfast", "fast", "medium", "slow"], index=1, key="batch_preset")
+
+        bprof = PROFILES[batch_profile]
+        _crf_lookup = {
+            "AVC (H.264)": bprof["h264"]["crf"],
+            "HEVC (H.265)": bprof["hevc"]["crf"],
+            "AV1": bprof["av1"]["crf"],
+        }
+        batch_crf = st.slider("CRF", 14, 45, int(_crf_lookup[batch_codec]), key="batch_crf")
+
+        bt1, bt2, bt3 = st.columns(3)
+        batch_grain = bt1.checkbox("Grain management", value=False, key="batch_grain")
+        batch_deband = bt2.checkbox("Debanding", value=False, key="batch_deband")
+        batch_strict = bt3.checkbox("Strict VBV", value=False, key="batch_strict")
+
+        if batch_files:
+            st.caption(f"{len(batch_files)} file(s) queued: " + ", ".join(f.name for f in batch_files))
+
+        if st.button("🚀 Run Batch Encode", type="primary", use_container_width=True):
+            if not batch_files:
+                st.error("Upload at least one file.")
+            else:
+                results = []
+                out_paths: List[Path] = []
+                n = len(batch_files)
+                master_bar = st.progress(0.0, text="Starting batch…")
+
+                for i, bf in enumerate(batch_files):
+                    sid = uuid.uuid4().hex
+
+                    try:
+                        sp = save_upload(bf, IN_DIR)
+                        sm = media(sp)
+
+                        opts = dict(
+                            codec=batch_codec,
+                            crf=batch_crf,
+                            preset=batch_preset,
+                            profile=batch_profile,
+                            denoise=False,
+                            sharpen=False,
+                            deblock=False,
+                            color=False,
+                            hdr_sdr=False,
+                            interp=False,
+                            scale_to="Source",
+                            image_mode="Ignore image",
+                            logo_pos="Top right",
+                            logo_scale=14,
+                            content_tune="Auto",
+                            cap_peak_bitrate=False,
+                            grain_removal=batch_grain,
+                            deband=batch_deband,
+                            strict_vbv=batch_strict,
+                        )
+
+                        def _cb(p, t, i=i, n=n, name=bf.name):
+                            master_bar.progress(min(0.999, (i + p) / n), text=f"[{i + 1}/{n}] {name} · {t}")
+
+                        out_p, log, md = encode_video(sp, None, opts, sm, sid, cb=_cb)
+
+                        if out_p:
+                            dm = media(out_p)
+                            saved = (1 - dm["size_mb"] / sm["size_mb"]) * 100 if sm["size_mb"] else 0
+                            results.append({
+                                "File": bf.name,
+                                "Output": out_p.name,
+                                "Size MB": round(dm["size_mb"], 2),
+                                "Saved %": round(saved, 1),
+                                "Encoder": md.get("actual_encoder", ""),
+                                "Status": "✅ Done",
+                            })
+                            out_paths.append(out_p)
+                        else:
+                            results.append({
+                                "File": bf.name,
+                                "Output": "—",
+                                "Size MB": None,
+                                "Saved %": None,
+                                "Encoder": "",
+                                "Status": f"❌ {md.get('error', 'Failed')}",
+                            })
+                    except Exception as e:
+                        results.append({
+                            "File": bf.name,
+                            "Output": "—",
+                            "Size MB": None,
+                            "Saved %": None,
+                            "Encoder": "",
+                            "Status": f"❌ {e}",
+                        })
+
+                master_bar.progress(1.0, text="Batch complete")
+
+                if results:
+                    st.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
+
+                if out_paths:
+                    zp = OUT_DIR / f"batch_{int(time.time())}.zip"
+                    with zipfile.ZipFile(zp, "w", zipfile.ZIP_DEFLATED) as z:
+                        for op in out_paths:
+                            z.write(op, op.name)
+
+                    st.download_button(
+                        "⬇ Download All Outputs (ZIP)",
+                        zp.read_bytes(),
+                        zp.name,
+                        "application/zip",
+                    )
 
 
 # ============================================================
@@ -2483,7 +2922,7 @@ with tab_player:
             if enable:
                 try:
                     webrtc_streamer(
-                        key="webrtc-v3",
+                        key="webrtc-v4",
                         rtc_configuration=RTCConfiguration(
                             {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
                         ),
@@ -2555,16 +2994,16 @@ with tab_sweep:
 
         sw1, sw2, sw3, sw4 = st.columns(4)
 
-        sw_codec = sw1.selectbox("Codec", ["AVC (H.264)", "HEVC (H.265)", "AV1"], key="sweep_codec_v3")
+        sw_codec = sw1.selectbox("Codec", ["AVC (H.264)", "HEVC (H.265)", "AV1"], key="sweep_codec_v4")
         sw_profile = sw2.selectbox(
             "Profile",
             [k for k in PROFILES if k != TARGET_PROFILE],
             index=1,
-            key="sweep_profile_v3",
+            key="sweep_profile_v4",
         )
-        sw_start = sw3.number_input("CRF start", 14, 45, 22, key="sweep_start_v3")
-        sw_end = sw4.number_input("CRF end", int(sw_start) + 1, 51, 38, key="sweep_end_v3")
-        sw_step = st.slider("Step", 1, 10, 4, key="sweep_step_v3")
+        sw_start = sw3.number_input("CRF start", 14, 45, 22, key="sweep_start_v4")
+        sw_end = sw4.number_input("CRF end", int(sw_start) + 1, 51, 38, key="sweep_end_v4")
+        sw_step = st.slider("Step", 1, 10, 4, key="sweep_step_v4")
 
         sweep_sample = st.selectbox(
             "Sweep sample duration",
@@ -2649,6 +3088,51 @@ with tab_sweep:
                     chart_cols = [c for c in ["Size MB", "VMAF", "SSIM"] if c in df.columns and df[c].notna().any()]
                     if chart_cols:
                         st.line_chart(df.set_index("CRF")[chart_cols])
+
+                    # ---- VMAF knee (diminishing-returns) detection ----
+                    # For each consecutive pair of sweep points we effectively have the
+                    # marginal quality gained per extra MB spent (dVMAF/dSize). Rather than
+                    # pick an arbitrary slope threshold, we find the point of maximum
+                    # perpendicular distance from the line connecting the cheapest/lowest-
+                    # quality point to the most expensive/highest-quality point — the
+                    # standard "elbow" construction — which identifies where a further
+                    # bitrate increase buys the least additional VMAF per MB.
+                    knee_row = None
+                    dknee = df.dropna(subset=["VMAF", "Size MB"]).sort_values("CRF").reset_index(drop=True)
+
+                    if len(dknee) >= 3:
+                        x = dknee["Size MB"].to_numpy(dtype=float)
+                        y = dknee["VMAF"].to_numpy(dtype=float)
+
+                        with np.errstate(divide="ignore", invalid="ignore"):
+                            marginal_vmaf_per_mb = np.diff(y) / np.diff(x)
+
+                        x_range = x.max() - x.min()
+                        y_range = y.max() - y.min()
+
+                        if x_range > 1e-9 and y_range > 1e-9:
+                            xn = (x - x.min()) / x_range
+                            yn = (y - y.min()) / y_range
+
+                            x1, y1, x2, y2 = xn[0], yn[0], xn[-1], yn[-1]
+                            num = np.abs((y2 - y1) * xn - (x2 - x1) * yn + x2 * y1 - y2 * x1)
+                            den = np.sqrt((y2 - y1) ** 2 + (x2 - x1) ** 2) + 1e-9
+                            dist = num / den
+
+                            knee_idx = int(np.argmax(dist))
+                            knee_row = dknee.iloc[knee_idx]
+
+                    if knee_row is not None:
+                        st.markdown(
+                            f"<div class='ok-strip'>🦵 <b>Mathematically optimal CRF ≈ {int(knee_row['CRF'])}</b> "
+                            f"— {knee_row['Size MB']:.2f} MB at VMAF {knee_row['VMAF']:.1f}. "
+                            f"This is the knee of the rate-distortion curve for this specific video: below this "
+                            f"CRF you're spending disproportionately more bits for diminishing VMAF gains; above "
+                            f"it, quality starts dropping faster than size savings justify.</div>",
+                            unsafe_allow_html=True,
+                        )
+                    elif len(dknee) < 3:
+                        st.caption("ℹ️ Knee detection needs at least 3 CRF points with measured VMAF — widen the sweep range or reduce the step to enable it.")
 
                     st.download_button(
                         "⬇ Download CSV",
@@ -2850,7 +3334,9 @@ with tab_logs:
                 f"SVT-AV1 {'✅' if has_encoder('libsvtav1') else '⚠️'} · "
                 f"AOM-AV1 {'✅' if has_encoder('libaom-av1') else '⚠️'} · "
                 f"libvmaf {'✅' if has_filter('libvmaf') else '⚠️'} · "
-                f"signalstats {'✅' if has_filter('signalstats') else '⚠️'}"
+                f"signalstats {'✅' if has_filter('signalstats') else '⚠️'} · "
+                f"nlmeans {'✅' if has_filter('nlmeans') else '⚠️'} · "
+                f"deband {'✅' if has_filter('deband') else '⚠️'}"
             )
 
             st.info("For Streamlit Cloud, add a repo-root file named `packages.txt` containing exactly: `ffmpeg`.")
@@ -2859,6 +3345,7 @@ with tab_logs:
                 "Recommended requirements.txt:\n"
                 "streamlit>=1.36\n"
                 "pandas>=2.0\n"
+                "numpy>=1.26\n"
                 "streamlit-webrtc>=0.47\n"
                 "av>=12.0\n",
                 language="text",
